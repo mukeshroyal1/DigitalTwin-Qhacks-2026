@@ -2,7 +2,7 @@
 
 **QHacks 2026**
 
-https://github.com/mukeshroyal1/DigitalTwin-Qhacks-2026
+https://devpost.com/software/digitaltwin-ygrvxo
 
 ## Description
 
