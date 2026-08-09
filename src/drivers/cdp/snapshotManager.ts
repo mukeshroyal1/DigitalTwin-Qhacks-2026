@@ -41,7 +41,6 @@ function shortId() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-/** Interesting-node rules ported from DigitalTwin-main 2 snapshot-manager. */
 function isInteresting(node: AxNode): boolean {
   if (node.ignored) return false;
   const role = node.role?.value || '';

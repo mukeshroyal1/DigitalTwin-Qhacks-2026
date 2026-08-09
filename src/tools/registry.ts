@@ -1,66 +1,57 @@
-import { takeSnapshotTool, searchElementsTool } from './browser/takeSnapshot';
+import { takeSnapshot, searchElements } from './browser/takeSnapshot';
 import {
-  clickElementTool,
-  fillElementTool,
-  hoverElementTool,
-  scrollPageTool,
-  waitTool,
+  clickElement,
+  fillElement,
+  hoverElement,
+  scrollPage,
+  wait,
 } from './browser/actions';
 import {
-  getAllTabsTool,
-  getCurrentTabTool,
-  createNewTabTool,
-  navigateToUrlTool,
-  goBackTool,
-  goForwardTool,
-  reloadTabTool,
-  switchToTabTool,
-  closeTabTool,
+  getAllTabs,
+  getCurrentTab,
+  createNewTab,
+  navigateToUrl,
+  goBack,
+  goForward,
+  reloadTab,
+  switchToTab,
+  closeTab,
 } from './tabs/tabTools';
-import { captureScreenshotTool } from './screenshot/captureTab';
-import type { RegisteredTool, ToolResult } from './types';
+import { captureScreenshot } from './screenshot/captureTab';
+import { listToolNames } from './definitions';
+import type { ToolHandler, ToolResult } from './types';
 
-const tools: RegisteredTool[] = [
-  takeSnapshotTool,
-  searchElementsTool,
-  clickElementTool,
-  hoverElementTool,
-  fillElementTool,
-  scrollPageTool,
-  waitTool,
-  getAllTabsTool,
-  getCurrentTabTool,
-  createNewTabTool,
-  navigateToUrlTool,
-  goBackTool,
-  goForwardTool,
-  reloadTabTool,
-  switchToTabTool,
-  closeTabTool,
-  captureScreenshotTool,
-];
-
-const byName = new Map(tools.map((t) => [t.definition.function.name, t]));
-
-export function getToolDefinitions() {
-  return tools.map((t) => t.definition);
-}
-
-export function listToolNames() {
-  return tools.map((t) => t.definition.function.name);
-}
+const handlers: Record<string, ToolHandler> = {
+  take_snapshot: takeSnapshot,
+  search_elements: searchElements,
+  click_element: clickElement,
+  hover_element: hoverElement,
+  fill_element: fillElement,
+  scroll_page: scrollPage,
+  wait,
+  get_all_tabs: getAllTabs,
+  get_current_tab: getCurrentTab,
+  create_new_tab: createNewTab,
+  navigate_to_url: navigateToUrl,
+  go_back: goBack,
+  go_forward: goForward,
+  reload_tab: reloadTab,
+  switch_to_tab: switchToTab,
+  close_tab: closeTab,
+  capture_tab_screenshot: captureScreenshot,
+};
 
 export async function executeTool(
   name: string,
   args: Record<string, unknown>
 ): Promise<ToolResult> {
-  const tool = byName.get(name);
-  if (!tool) {
+  const handler = handlers[name];
+  if (!handler) {
     return {
       success: false,
       error: `Unknown tool "${name}". Available tools: ${listToolNames().join(', ')}.`,
     };
   }
 
-  return tool.execute(args || {});
+  return handler(args || {});
 }

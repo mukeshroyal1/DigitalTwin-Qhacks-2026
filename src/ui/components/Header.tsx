@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { sendToBackground } from '../../shared/messaging';
+import { useSettings } from '../context/SettingsContext';
 
 type HeaderProps = {
   showSettings: boolean;
@@ -14,17 +14,22 @@ export function Header({
   onToggleSettings,
   onToggleMemory,
 }: HeaderProps) {
-  const [apiKey, setApiKey] = useState('');
+  const { apiKey, setApiKey } = useSettings();
+  const [draftKey, setDraftKey] = useState(apiKey);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
-    void sendToBackground<{ apiKey: string }>({ type: 'GET_SETTINGS' }).then((res) => {
-      if (res?.apiKey) setApiKey(res.apiKey);
-    });
-  }, []);
+    setDraftKey(apiKey);
+  }, [apiKey]);
 
   const saveKey = async () => {
-    await sendToBackground({ type: 'SET_API_KEY', apiKey });
+    const result = await setApiKey(draftKey);
+    if (!result.ok) {
+      setSaveError(result.error || 'Save failed');
+      return;
+    }
+    setSaveError(null);
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
   };
@@ -54,13 +59,14 @@ export function Header({
                 className="api-key-input"
                 type="password"
                 placeholder="Backboard API key"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
+                value={draftKey}
+                onChange={(e) => setDraftKey(e.target.value)}
               />
-              <button type="button" className="api-key-save" onClick={saveKey}>
+              <button type="button" className="api-key-save" onClick={() => void saveKey()}>
                 {saved ? 'Saved' : 'Save'}
               </button>
             </div>
+            {saveError && <div className="settings-error">{saveError}</div>}
           </div>
         </div>
         <button

@@ -16,7 +16,7 @@ export function MessageList({ messages }: MessageListProps) {
   }, [messages]);
 
   return (
-    <div className={`messages ${hasMessages ? 'has-messages' : ''}`} id="msgs">
+    <div className="messages">
       {!hasMessages && <EmptyState />}
       {messages.map((message) => (
         <ChatMessage key={message.id} message={message} />

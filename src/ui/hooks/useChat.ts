@@ -1,31 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChatMessage } from '../../shared/types/chat';
-import { sendToBackground } from '../../shared/messaging';
-import { runAgent, type AgentEvent } from '../../agent/loop';
-import type { ToolResult } from '../../tools/types';
+import type { AgentEvent } from '../../shared/types/agent';
+import { sendToBackground, type PortMessage } from '../../shared/messaging';
+import { useSettings } from '../context/SettingsContext';
 
 function createId() {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export function useChat(memoryEnabled: boolean) {
+export function useChat() {
+  const { apiKey, memoryEnabled } = useSettings();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isSending, setIsSending] = useState(false);
   const thinkingIdRef = useRef<string | null>(null);
   const runningRef = useRef(false);
-
-  // Hold a Port so the service worker stays alive while tools run
-  useEffect(() => {
-    const port = chrome.runtime.connect({ name: 'sidepanel' });
-    return () => {
-      try {
-        port.disconnect();
-      } catch {
-        // ignore
-      }
-    };
-  }, []);
+  const runIdRef = useRef<string | null>(null);
+  const portRef = useRef<chrome.runtime.Port | null>(null);
 
   const applyEvent = useCallback((event: AgentEvent) => {
     const thinkingId = thinkingIdRef.current;
@@ -100,12 +91,68 @@ export function useChat(memoryEnabled: boolean) {
       setIsSending(false);
       thinkingIdRef.current = null;
       runningRef.current = false;
+      runIdRef.current = null;
     }
   }, []);
 
-  const sendMessage = useCallback(async () => {
-    const text = inputValue.trim();
+  useEffect(() => {
+    const port = chrome.runtime.connect({ name: 'sidepanel' });
+    portRef.current = port;
+
+    const onMessage = (message: PortMessage) => {
+      if (message.type !== 'AGENT_EVENT') return;
+      if (runIdRef.current && message.runId !== runIdRef.current) return;
+      applyEvent(message.event);
+    };
+
+    port.onMessage.addListener(onMessage);
+    return () => {
+      port.onMessage.removeListener(onMessage);
+      portRef.current = null;
+      try {
+        port.disconnect();
+      } catch {
+        // ignore
+      }
+    };
+  }, [applyEvent]);
+
+  const cancelMessage = useCallback(async () => {
+    const runId = runIdRef.current;
+    if (!runId) return;
+    try {
+      await sendToBackground({ type: 'ABORT_AGENT', runId });
+    } catch {
+      // ignore — UI will still wait for done/cancel events if any
+    }
+  }, []);
+
+  const sendMessage = useCallback(async (overrideText?: string) => {
+    const text = (overrideText ?? inputValue).trim();
     if (!text || isSending || runningRef.current) return;
+
+    if (!apiKey.trim()) {
+      const nextThinkingId = createId();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: createId(),
+          role: 'user',
+          content: text,
+          status: 'done',
+          createdAt: Date.now(),
+        },
+        {
+          id: nextThinkingId,
+          role: 'assistant',
+          content: 'Add your Backboard API key in settings first.',
+          status: 'error',
+          createdAt: Date.now(),
+        },
+      ]);
+      setInputValue('');
+      return;
+    }
 
     const userMessage: ChatMessage = {
       id: createId(),
@@ -125,43 +172,26 @@ export function useChat(memoryEnabled: boolean) {
       createdAt: Date.now(),
     };
 
+    const runId = createId();
     setInputValue('');
     setIsSending(true);
     runningRef.current = true;
     thinkingIdRef.current = nextThinkingId;
+    runIdRef.current = runId;
     setMessages((prev) => [...prev, userMessage, thinkingMessage]);
 
     try {
-      const settings = await sendToBackground<{ apiKey?: string }>({ type: 'GET_SETTINGS' });
-      const apiKey = settings?.apiKey || '';
-      if (!apiKey) {
-        applyEvent({
-          kind: 'error',
-          text: 'Add your Backboard API key in settings first.',
-        });
-        applyEvent({ kind: 'done' });
-        return;
-      }
-
-      // Agent loop lives in the side panel (legacy DigitalTwin-main 2 pattern).
-      // Browser tools execute in the service worker via EXECUTE_TOOL.
-      await runAgent({
-        apiKey,
+      const res = await sendToBackground({
+        type: 'RUN_AGENT',
+        runId,
         text,
         memoryEnabled,
-        onEvent: applyEvent,
-        executeTool: async (name, args) => {
-          const result = await sendToBackground<ToolResult>({
-            type: 'EXECUTE_TOOL',
-            name,
-            args,
-          });
-          if (!result || typeof result !== 'object') {
-            return { success: false, error: 'No response from background tool runner' };
-          }
-          return result;
-        },
       });
+
+      if (!res.ok) {
+        applyEvent({ kind: 'error', text: res.error });
+        applyEvent({ kind: 'done' });
+      }
     } catch (error) {
       applyEvent({
         kind: 'error',
@@ -169,13 +199,14 @@ export function useChat(memoryEnabled: boolean) {
       });
       applyEvent({ kind: 'done' });
     }
-  }, [inputValue, isSending, memoryEnabled, applyEvent]);
+  }, [inputValue, isSending, apiKey, memoryEnabled, applyEvent]);
 
   return {
     messages,
     inputValue,
     setInputValue,
     sendMessage,
+    cancelMessage,
     isSending,
   };
 }

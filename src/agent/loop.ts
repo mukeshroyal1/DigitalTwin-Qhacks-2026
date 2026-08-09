@@ -1,16 +1,11 @@
 import * as Backboard from './providers/backboard';
 import { ASSISTANT_NAME } from './providers/backboard';
 import { SYSTEM_PROMPT } from './prompts/system';
-import { getToolDefinitions } from '../tools/registry';
+import { getToolDefinitions } from '../tools/definitions';
 import type { ToolResult } from '../tools/types';
+import type { AgentEvent } from '../shared/types/agent';
 
-export type AgentEvent =
-  | { kind: 'status'; text: string }
-  | { kind: 'tool'; name: string; status: 'start' | 'done' | 'error' }
-  | { kind: 'message'; text: string }
-  | { kind: 'screenshot'; imageData: string; title?: string }
-  | { kind: 'error'; text: string }
-  | { kind: 'done' };
+export type { AgentEvent };
 
 export type ToolExecutor = (
   name: string,
@@ -23,6 +18,7 @@ type RunOptions = {
   memoryEnabled: boolean;
   onEvent: (event: AgentEvent) => void;
   executeTool: ToolExecutor;
+  signal?: AbortSignal;
 };
 
 type BackboardResponse = {
@@ -40,6 +36,19 @@ type BackboardResponse = {
 };
 
 const MAX_ITERS = 16;
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new DOMException('Agent run aborted', 'AbortError');
+  }
+}
+
+function isAbortError(error: unknown) {
+  return (
+    (error instanceof DOMException && error.name === 'AbortError') ||
+    (error instanceof Error && error.name === 'AbortError')
+  );
+}
 
 function parseArgs(raw: unknown): Record<string, unknown> {
   if (typeof raw === 'string') {
@@ -76,13 +85,8 @@ function getPendingToolCalls(resp: BackboardResponse): Array<Record<string, unkn
   const terminal = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED']);
   if (terminal.has(status)) return [];
 
-  // Explicit pending
   if (status === 'REQUIRES_ACTION' || fromAction.length > 0) return calls;
-
-  // Legacy: tool_calls + run_id
   if (resp.run_id) return calls;
-
-  // Ambiguous empty status: only act if there is no final assistant text yet
   if (!status && !getContent(resp)) return calls;
 
   return [];
@@ -106,38 +110,52 @@ function newestThread(threads: Backboard.BackboardThread[]) {
   })[0];
 }
 
-async function ensureAssistant(apiKey: string) {
+async function ensureAssistant(apiKey: string, signal?: AbortSignal) {
   const tools = getToolDefinitions();
-  const assistants = await Backboard.listAssistants(apiKey);
+  const assistants = await Backboard.listAssistants(apiKey, signal);
   const existing = assistants.find((a) => a.name === ASSISTANT_NAME);
 
   if (existing?.assistant_id) {
-    await Backboard.updateAssistant(apiKey, existing.assistant_id, {
-      system_prompt: SYSTEM_PROMPT,
-      tools,
-    });
+    await Backboard.updateAssistant(
+      apiKey,
+      existing.assistant_id,
+      {
+        system_prompt: SYSTEM_PROMPT,
+        tools,
+      },
+      signal
+    );
     return existing.assistant_id;
   }
 
-  const created = await Backboard.createAssistant(apiKey, {
-    name: ASSISTANT_NAME,
-    system_prompt: SYSTEM_PROMPT,
-    tools,
-  });
+  const created = await Backboard.createAssistant(
+    apiKey,
+    {
+      name: ASSISTANT_NAME,
+      system_prompt: SYSTEM_PROMPT,
+      tools,
+    },
+    signal
+  );
   return created.assistantId;
 }
 
-async function getThreadId(apiKey: string, assistantId: string, memoryEnabled: boolean) {
+async function getThreadId(
+  apiKey: string,
+  assistantId: string,
+  memoryEnabled: boolean,
+  signal?: AbortSignal
+) {
   if (!memoryEnabled) {
-    const thread = await Backboard.createThread(apiKey, assistantId);
+    const thread = await Backboard.createThread(apiKey, assistantId, signal);
     return thread.threadId;
   }
 
-  const threads = await Backboard.listThreads(apiKey, assistantId);
+  const threads = await Backboard.listThreads(apiKey, assistantId, signal);
   const latest = newestThread(threads);
   if (latest?.thread_id) return latest.thread_id;
 
-  const created = await Backboard.createThread(apiKey, assistantId);
+  const created = await Backboard.createThread(apiKey, assistantId, signal);
   return created.threadId;
 }
 
@@ -147,164 +165,190 @@ export async function runAgent({
   memoryEnabled,
   onEvent,
   executeTool,
+  signal,
 }: RunOptions) {
-  onEvent({ kind: 'status', text: 'Thinking' });
+  try {
+    throwIfAborted(signal);
+    onEvent({ kind: 'status', text: 'Thinking' });
 
-  const assistantId = await ensureAssistant(apiKey);
-  const threadId = await getThreadId(apiKey, assistantId, memoryEnabled);
+    const assistantId = await ensureAssistant(apiKey, signal);
+    throwIfAborted(signal);
+    const threadId = await getThreadId(apiKey, assistantId, memoryEnabled, signal);
+    throwIfAborted(signal);
 
-  let resp = (await Backboard.addMessage(apiKey, threadId, {
-    content: text,
-    memory: memoryEnabled ? 'Auto' : 'off',
-    llm_provider: 'openai',
-    model_name: 'gpt-4o-mini',
-  })) as BackboardResponse;
+    let resp = (await Backboard.addMessage(
+      apiKey,
+      threadId,
+      {
+        content: text,
+        memory: memoryEnabled ? 'Auto' : 'off',
+        llm_provider: 'openai',
+        model_name: 'gpt-4o-mini',
+      },
+      signal
+    )) as BackboardResponse;
 
-  const lastErrors: string[] = [];
-  const seenCallIds = new Set<string>();
+    const lastErrors: string[] = [];
+    const seenCallIds = new Set<string>();
 
-  for (let i = 0; i < MAX_ITERS; i++) {
-    const toolCalls = getPendingToolCalls(resp).filter((call) => {
-      const id = String(call.id || call.tool_call_id || '');
-      if (!id) return true;
-      if (seenCallIds.has(id)) return false;
-      return true;
-    });
-    const content = getContent(resp);
+    for (let i = 0; i < MAX_ITERS; i++) {
+      throwIfAborted(signal);
 
-    // Only finish when there are no pending tool calls
-    if (!toolCalls.length) {
-      onEvent({
-        kind: 'message',
-        text: content || 'Done.',
+      const toolCalls = getPendingToolCalls(resp).filter((call) => {
+        const id = String(call.id || call.tool_call_id || '');
+        if (!id) return true;
+        if (seenCallIds.has(id)) return false;
+        return true;
       });
-      onEvent({ kind: 'done' });
-      return;
-    }
+      const content = getContent(resp);
 
-    onEvent({
-      kind: 'status',
-      text: `In Action (${toolCalls.length} tool${toolCalls.length === 1 ? '' : 's'})`,
-    });
-
-    const outputs: Array<{ tool_call_id: string; output: string }> = [];
-
-    for (let idx = 0; idx < toolCalls.length; idx++) {
-      const call = toolCalls[idx];
-      const fn = call.function as { name?: string; arguments?: unknown } | undefined;
-      const name = String(fn?.name || call.name || '');
-      const args = parseArgs(fn?.arguments ?? call.arguments);
-      const callId = String(call.id || call.tool_call_id || '');
-
-      if (!name || !callId) {
-        outputs.push({
-          tool_call_id: callId || `invalid-${idx}`,
-          output: JSON.stringify({
-            success: false,
-            error: !name ? 'Tool call missing name' : 'Tool call missing id',
-          }),
-        });
-        continue;
-      }
-
-      seenCallIds.add(callId);
-      onEvent({ kind: 'tool', name, status: 'start' });
-      let result: ToolResult;
-      try {
-        result = await executeTool(name, args);
-      } catch (error) {
-        result = {
-          success: false,
-          error: error instanceof Error ? error.message : 'Tool threw',
-        };
-      }
-      onEvent({
-        kind: 'tool',
-        name,
-        status: result.success ? 'done' : 'error',
-      });
-
-      if (!result.success) {
-        lastErrors.push(`${name}: ${result.error || result.message || 'failed'}`);
-        if (lastErrors.length > 6) lastErrors.shift();
-      }
-
-      if (name === 'capture_tab_screenshot' && result.success) {
-        const imageData = (result.data as { imageData?: string } | undefined)?.imageData;
-        if (imageData) {
-          onEvent({
-            kind: 'screenshot',
-            imageData,
-            title: (result.data as { title?: string })?.title,
-          });
-        }
-      }
-
-      const safe =
-        name === 'capture_tab_screenshot' && result.success
-          ? {
-              success: true,
-              message: result.message,
-              data: {
-                title: (result.data as { title?: string })?.title,
-                url: (result.data as { url?: string })?.url,
-              },
-            }
-          : result;
-
-      outputs.push({
-        tool_call_id: callId,
-        output: JSON.stringify(safe),
-      });
-    }
-
-    if (!outputs.length) {
-      onEvent({ kind: 'error', text: 'Tool calls produced no outputs' });
-      onEvent({ kind: 'done' });
-      return;
-    }
-
-    try {
-      resp = (await Backboard.submitToolOutputs(
-        apiKey,
-        threadId,
-        outputs
-      )) as BackboardResponse;
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : 'Tool submit failed';
-      // If the server already closed the run, finish with whatever we have
-      if (/no pending tool calls|nothing to submit|404/i.test(msg)) {
-        const toolSummary = outputs
-          .map((o) => {
-            try {
-              const parsed = JSON.parse(o.output) as ToolResult;
-              return parsed.success
-                ? parsed.message || 'ok'
-                : parsed.error || 'failed';
-            } catch {
-              return 'done';
-            }
-          })
-          .join('; ');
+      if (!toolCalls.length) {
         onEvent({
           kind: 'message',
-          text:
-            content ||
-            `Finished local actions (${toolSummary}). The model run had already closed — try your request again if the page did not update.`,
+          text: content || 'Done.',
         });
         onEvent({ kind: 'done' });
         return;
       }
-      onEvent({ kind: 'error', text: `Tool submit failed: ${msg}` });
+
+      onEvent({
+        kind: 'status',
+        text: `In Action (${toolCalls.length} tool${toolCalls.length === 1 ? '' : 's'})`,
+      });
+
+      const outputs: Array<{ tool_call_id: string; output: string }> = [];
+
+      for (let idx = 0; idx < toolCalls.length; idx++) {
+        throwIfAborted(signal);
+
+        const call = toolCalls[idx];
+        const fn = call.function as { name?: string; arguments?: unknown } | undefined;
+        const name = String(fn?.name || call.name || '');
+        const args = parseArgs(fn?.arguments ?? call.arguments);
+        const callId = String(call.id || call.tool_call_id || '');
+
+        if (!name || !callId) {
+          outputs.push({
+            tool_call_id: callId || `invalid-${idx}`,
+            output: JSON.stringify({
+              success: false,
+              error: !name ? 'Tool call missing name' : 'Tool call missing id',
+            }),
+          });
+          continue;
+        }
+
+        seenCallIds.add(callId);
+        onEvent({ kind: 'tool', name, status: 'start' });
+        let result: ToolResult;
+        try {
+          result = await executeTool(name, args);
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          result = {
+            success: false,
+            error: error instanceof Error ? error.message : 'Tool threw',
+          };
+        }
+        throwIfAborted(signal);
+
+        onEvent({
+          kind: 'tool',
+          name,
+          status: result.success ? 'done' : 'error',
+        });
+
+        if (!result.success) {
+          lastErrors.push(`${name}: ${result.error || result.message || 'failed'}`);
+          if (lastErrors.length > 6) lastErrors.shift();
+        }
+
+        if (name === 'capture_tab_screenshot' && result.success) {
+          const imageData = (result.data as { imageData?: string } | undefined)?.imageData;
+          if (imageData) {
+            onEvent({
+              kind: 'screenshot',
+              imageData,
+              title: (result.data as { title?: string })?.title,
+            });
+          }
+        }
+
+        const safe =
+          name === 'capture_tab_screenshot' && result.success
+            ? {
+                success: true,
+                message: result.message,
+                data: {
+                  title: (result.data as { title?: string })?.title,
+                  url: (result.data as { url?: string })?.url,
+                },
+              }
+            : result;
+
+        outputs.push({
+          tool_call_id: callId,
+          output: JSON.stringify(safe),
+        });
+      }
+
+      if (!outputs.length) {
+        onEvent({ kind: 'error', text: 'Tool calls produced no outputs' });
+        onEvent({ kind: 'done' });
+        return;
+      }
+
+      try {
+        throwIfAborted(signal);
+        resp = (await Backboard.submitToolOutputs(
+          apiKey,
+          threadId,
+          outputs,
+          signal
+        )) as BackboardResponse;
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        const msg = error instanceof Error ? error.message : 'Tool submit failed';
+        if (/no pending tool calls|nothing to submit|404/i.test(msg)) {
+          const toolSummary = outputs
+            .map((o) => {
+              try {
+                const parsed = JSON.parse(o.output) as ToolResult;
+                return parsed.success
+                  ? parsed.message || 'ok'
+                  : parsed.error || 'failed';
+              } catch {
+                return 'done';
+              }
+            })
+            .join('; ');
+          onEvent({
+            kind: 'message',
+            text:
+              content ||
+              `Finished local actions (${toolSummary}). The model run had already closed — try your request again if the page did not update.`,
+          });
+          onEvent({ kind: 'done' });
+          return;
+        }
+        onEvent({ kind: 'error', text: `Tool submit failed: ${msg}` });
+        onEvent({ kind: 'done' });
+        return;
+      }
+    }
+
+    const hint = lastErrors.length ? ` Last errors: ${lastErrors.join('; ')}` : '';
+    onEvent({
+      kind: 'error',
+      text: `Stopped after too many tool steps.${hint}`,
+    });
+    onEvent({ kind: 'done' });
+  } catch (error) {
+    if (isAbortError(error)) {
+      onEvent({ kind: 'error', text: 'Cancelled.' });
       onEvent({ kind: 'done' });
       return;
     }
+    throw error;
   }
-
-  const hint = lastErrors.length ? ` Last errors: ${lastErrors.join('; ')}` : '';
-  onEvent({
-    kind: 'error',
-    text: `Stopped after too many tool steps.${hint}`,
-  });
-  onEvent({ kind: 'done' });
 }

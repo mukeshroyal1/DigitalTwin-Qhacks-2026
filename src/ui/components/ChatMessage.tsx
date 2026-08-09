@@ -10,7 +10,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
   const isThinking = message.status === 'thinking';
 
   return (
-    <div className={`chat-bubble ${isUser ? 'user' : 'gpt'}`}>
+    <div className={`chat-bubble ${isUser ? 'user' : 'assistant'}`}>
       <div className="content">
         {isThinking ? (
           <StatusIndicator text={message.actionText || 'Thinking'} />

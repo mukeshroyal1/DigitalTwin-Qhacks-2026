@@ -19,8 +19,3 @@ export type ToolResult = {
 };
 
 export type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
-
-export type RegisteredTool = {
-  definition: ToolDefinition;
-  execute: ToolHandler;
-};

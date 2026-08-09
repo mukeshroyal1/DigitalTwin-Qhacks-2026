@@ -6,11 +6,6 @@ type Box = { x: number; y: number; width: number; height: number };
 
 const UID_ATTR = 'data-dt-uid';
 
-/**
- * Port of DigitalTwin-main 2 SmartLocator click/fill/hover:
- * scroll → bounding box → covered check → CDP mouse (or DOM click if covered).
- * Skips fake mouse / highlight chrome.
- */
 export class ElementLocator {
   private cdp: CdpCommander;
 
@@ -151,7 +146,6 @@ export class ElementLocator {
     }
   }
 
-  /** Re-stamp uid if the page wiped attributes since snapshot. */
   private async ensureUidAttr() {
     if (!this.node.backendDOMNodeId) return;
     try {
